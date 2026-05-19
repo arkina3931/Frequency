@@ -88,7 +88,6 @@ class SSR(GeneralRecommender):
             self.has_user_graph = False
             print(f">>>>Not found user_emb_file from {user_emb_path}")
 
-        mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
         self.has_item_graph = True
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
@@ -97,10 +96,36 @@ class SSR(GeneralRecommender):
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             self.text_trs = nn.Linear(self.t_feat.shape[1], self.feat_embed_dim)
 
-        if os.path.exists(mm_adj_file) and False:
-            self.mm_adj = torch.load(mm_adj_file)
-            print(">>>>>Loaded from: ", mm_adj_file)
-        else:
+        v_dim = int(self.v_feat.shape[1]) if self.v_feat is not None else 0
+        t_dim = int(self.t_feat.shape[1]) if self.t_feat is not None else 0
+        weight_token = str(self.mm_image_weight).replace('-', 'm').replace('.', 'p')
+        mm_adj_file = os.path.join(
+            dataset_path,
+            'mm_adj_ssr_{}_k{}_w{}_v{}_t{}.pt'.format(config['dataset'], self.knn_k, weight_token, v_dim, t_dim)
+        )
+        mm_adj_meta = {
+            'dataset': config['dataset'],
+            'knn_k': int(self.knn_k),
+            'mm_image_weight': float(self.mm_image_weight),
+            'v_dim': v_dim,
+            't_dim': t_dim,
+            'n_items': int(self.n_items),
+        }
+        use_mm_adj_cache = config['use_mm_adj_cache']
+        use_mm_adj_cache = True if use_mm_adj_cache is None else bool(use_mm_adj_cache)
+
+        if use_mm_adj_cache and os.path.exists(mm_adj_file):
+            try:
+                ckpt = torch.load(mm_adj_file, map_location=self.device)
+                if isinstance(ckpt, dict) and ckpt.get('meta') == mm_adj_meta and 'adj' in ckpt:
+                    self.mm_adj = ckpt['adj'].to(self.device)
+                    print(">>>>>Loaded mm_adj from: ", mm_adj_file)
+                else:
+                    print(">>>>>Skip stale mm_adj cache: ", mm_adj_file)
+            except Exception as e:
+                print(">>>>>Failed to load mm_adj cache {}: {}".format(mm_adj_file, e))
+
+        if self.mm_adj is None:
             if self.v_feat is not None:
                 indices, image_adj = self.get_knn_adj_mat(self.image_embedding.weight.detach())
                 self.mm_adj = image_adj
@@ -111,8 +136,9 @@ class SSR(GeneralRecommender):
                 self.mm_adj = self.mm_image_weight * image_adj + (1.0 - self.mm_image_weight) * text_adj
                 del text_adj
                 del image_adj
-            torch.save(self.mm_adj, mm_adj_file)
-            print(">>>>>Save mm_adj to: ", mm_adj_file)
+            if use_mm_adj_cache:
+                torch.save({'meta': mm_adj_meta, 'adj': self.mm_adj.detach().cpu()}, mm_adj_file)
+                print(">>>>>Save mm_adj to: ", mm_adj_file)
 
         # packing interaction in training into edge_index
         train_interactions = dataset.inter_matrix(form='coo').astype(np.float32)

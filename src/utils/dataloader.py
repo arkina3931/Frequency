@@ -55,6 +55,11 @@ class AbstractDataLoader(object):
         self.sparsity = 1 - self.dataset.inter_num / self.dataset.user_num / self.dataset.item_num
         self.pr = 0
         self.inter_pr = 0
+        self._refresh_cached_arrays()
+
+    def _refresh_cached_arrays(self):
+        self.uid_array = self.dataset.df[self.dataset.uid_field].to_numpy(copy=False)
+        self.iid_array = self.dataset.df[self.dataset.iid_field].to_numpy(copy=False)
 
     def pretrain_setup(self):
         """This function can be used to deal with some problems after essential args are initialized,
@@ -115,6 +120,7 @@ class TrainDataLoader(AbstractDataLoader):
         # full items in training.
         self.all_items = self.dataset.df[self.dataset.iid_field].unique().tolist()
         self.all_uids = self.dataset.df[self.dataset.uid_field].unique()
+        self.all_users = self.all_uids.tolist()
         self.all_items_set = set(self.all_items)
         self.all_users_set = set(self.all_uids)
         self.all_item_len = len(self.all_items)
@@ -145,9 +151,11 @@ class TrainDataLoader(AbstractDataLoader):
         # sort & random
         if self.shuffle:
             self.dataset = self.dataset_bk.copy(self.dataset_bk.df)
+            self._refresh_cached_arrays()
         self.all_items.sort()
         if self.use_full_sampling:
             self.all_uids.sort()
+        self.all_users = self.all_uids.tolist()
         random.shuffle(self.all_items)
         # reorder dataset as default (chronological order)
         #self.dataset.sort_by_chronological()
@@ -217,28 +225,30 @@ class TrainDataLoader(AbstractDataLoader):
 
     def _shuffle(self):
         self.dataset.shuffle()
+        self._refresh_cached_arrays()
         if self.use_full_sampling:
             np.random.shuffle(self.all_uids)
+            self.all_users = self.all_uids.tolist()
 
     def _next_batch_data(self):
         return self.sample_func()
 
     def _get_neg_sample(self):
-        cur_data = self.dataset[self.pr: self.pr + self.step]
-        self.pr += self.step
+        start = self.pr
+        end = min(self.pr + self.step, self.pr_end)
+        user_ids = self.uid_array[start:end]
+        item_ids = self.iid_array[start:end]
+        self.pr = end
         # to tensor
-        user_tensor = torch.tensor(cur_data[self.config['USER_ID_FIELD']].values).type(torch.LongTensor).to(self.device)
-        item_tensor = torch.tensor(cur_data[self.config['ITEM_ID_FIELD']].values).type(torch.LongTensor).to(self.device)
+        user_tensor = torch.as_tensor(user_ids, dtype=torch.long, device=self.device)
+        item_tensor = torch.as_tensor(item_ids, dtype=torch.long, device=self.device)
         batch_tensor = torch.cat((torch.unsqueeze(user_tensor, 0),
                                   torch.unsqueeze(item_tensor, 0)))
-        u_ids = cur_data[self.config['USER_ID_FIELD']]
         # sampling negative items only in the dataset (train)
-        neg_ids = self._sample_neg_ids(u_ids).to(self.device)
+        neg_ids = self._sample_neg_ids(user_ids)
         # for neighborhood loss
         if self.neighborhood_loss_required:
-            i_ids = cur_data[self.config['ITEM_ID_FIELD']]
-            pos_neighbors, neg_neighbors = self._get_neighborhood_samples(i_ids, self.config['ITEM_ID_FIELD'])
-            pos_neighbors, neg_neighbors = pos_neighbors.to(self.device), neg_neighbors.to(self.device)
+            pos_neighbors, neg_neighbors = self._get_neighborhood_samples(item_ids, self.config['ITEM_ID_FIELD'])
 
             batch_tensor = torch.cat((batch_tensor, neg_ids.unsqueeze(0),
                                       pos_neighbors.unsqueeze(0), neg_neighbors.unsqueeze(0)))
@@ -250,18 +260,22 @@ class TrainDataLoader(AbstractDataLoader):
         return batch_tensor
 
     def _get_non_neg_sample(self):
-        cur_data = self.dataset[self.pr: self.pr + self.step]
-        self.pr += self.step
+        start = self.pr
+        end = min(self.pr + self.step, self.pr_end)
+        user_ids = self.uid_array[start:end]
+        item_ids = self.iid_array[start:end]
+        self.pr = end
         # to tensor
-        user_tensor = torch.tensor(cur_data[self.config['USER_ID_FIELD']].values).type(torch.LongTensor).to(self.device)
-        item_tensor = torch.tensor(cur_data[self.config['ITEM_ID_FIELD']].values).type(torch.LongTensor).to(self.device)
+        user_tensor = torch.as_tensor(user_ids, dtype=torch.long, device=self.device)
+        item_tensor = torch.as_tensor(item_ids, dtype=torch.long, device=self.device)
         batch_tensor = torch.cat((torch.unsqueeze(user_tensor, 0),
                                   torch.unsqueeze(item_tensor, 0)))
         return batch_tensor
 
     def _get_full_uids_sample(self):
-        user_tensor = torch.tensor(self.all_uids[self.pr: self.pr + self.step]).type(torch.LongTensor).to(self.device)
-        self.pr += self.step
+        end = min(self.pr + self.step, self.pr_end)
+        user_tensor = torch.as_tensor(self.all_uids[self.pr:end], dtype=torch.long, device=self.device)
+        self.pr = end
         return user_tensor
 
     def _sample_neg_ids(self, u_ids):
@@ -272,7 +286,7 @@ class TrainDataLoader(AbstractDataLoader):
             while iid in self.history_items_per_u[u]:
                 iid = self._random()
             neg_ids.append(iid)
-        return torch.tensor(neg_ids).type(torch.LongTensor)
+        return torch.as_tensor(neg_ids, dtype=torch.long, device=self.device)
 
     def _get_my_neighbors(self, id_str):
         ret_dict = {}
@@ -289,6 +303,7 @@ class TrainDataLoader(AbstractDataLoader):
     def _get_neighborhood_samples(self, ids, id_str):
         a2a_dict = self.user_user_dict if id_str == self.config['USER_ID_FIELD'] else self.item_item_dict
         all_set = self.all_users_set if id_str == self.config['USER_ID_FIELD'] else self.all_items_set
+        all_values = self.all_users if id_str == self.config['USER_ID_FIELD'] else self.all_items
         pos_ids, neg_ids = [], []
         for i in ids:
             pos_ids_my = a2a_dict[i]
@@ -296,13 +311,14 @@ class TrainDataLoader(AbstractDataLoader):
                 pos_ids.append(0)
                 neg_ids.append(0)
                 continue
-            pos_id = random.sample(pos_ids_my, 1)[0]
+            pos_id = random.choice(tuple(pos_ids_my))
             pos_ids.append(pos_id)
-            neg_id = random.sample(all_set, 1)[0]
+            neg_id = random.choice(all_values)
             while neg_id in pos_ids_my:
-                neg_id = random.sample(all_set, 1)[0]
+                neg_id = random.choice(all_values)
             neg_ids.append(neg_id)
-        return torch.tensor(pos_ids).type(torch.LongTensor), torch.tensor(neg_ids).type(torch.LongTensor)
+        return (torch.as_tensor(pos_ids, dtype=torch.long, device=self.device),
+                torch.as_tensor(neg_ids, dtype=torch.long, device=self.device))
 
     def _random(self):
         rd_id = random.sample(self.all_items, 1)[0]
@@ -344,10 +360,12 @@ class EvalDataLoader(AbstractDataLoader):
 
         self.eval_u = self.dataset.df[self.dataset.uid_field].unique()
         # special for eval dataloader
-        self.pos_items_per_u = self._get_pos_items_per_u(self.eval_u).to(self.device)
+        self.pos_items_per_u = self._get_pos_items_per_u(self.eval_u)
         self._get_eval_items_per_u(self.eval_u)
+        self.train_pos_len_list = np.asarray(self.train_pos_len_list, dtype=np.int64)
+        self.train_pos_offsets = np.concatenate(([0], np.cumsum(self.train_pos_len_list)))
         # to device
-        self.eval_u = torch.tensor(self.eval_u).type(torch.LongTensor).to(self.device)
+        self.eval_u = torch.as_tensor(self.eval_u, dtype=torch.long, device=self.device)
 
     @property
     def pr_end(self):
@@ -357,13 +375,16 @@ class EvalDataLoader(AbstractDataLoader):
         self.dataset.shuffle()
 
     def _next_batch_data(self):
-        inter_cnt = sum(self.train_pos_len_list[self.pr: self.pr+self.step])
-        batch_users = self.eval_u[self.pr: self.pr + self.step]
-        batch_mask_matrix = self.pos_items_per_u[:, self.inter_pr: self.inter_pr+inter_cnt].clone()
+        start = self.pr
+        end = min(self.pr + self.step, self.pr_end)
+        inter_start = int(self.train_pos_offsets[start])
+        inter_end = int(self.train_pos_offsets[end])
+        batch_users = self.eval_u[start:end]
+        batch_mask_matrix = self.pos_items_per_u[:, inter_start:inter_end].clone()
         # user_ids to index
-        batch_mask_matrix[0] -= self.pr
-        self.inter_pr += inter_cnt
-        self.pr += self.step
+        batch_mask_matrix[0] -= start
+        self.inter_pr = inter_end
+        self.pr = end
 
         return [batch_users, batch_mask_matrix]
 
@@ -388,7 +409,7 @@ class EvalDataLoader(AbstractDataLoader):
             self.train_pos_len_list.append(i_len)
             u_ids.extend([i]*i_len)
             i_ids.extend(u_ls)
-        return torch.tensor([u_ids, i_ids]).type(torch.LongTensor)
+        return torch.as_tensor([u_ids, i_ids], dtype=torch.long, device=self.device)
 
     def _get_eval_items_per_u(self, eval_users):
         """

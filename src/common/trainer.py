@@ -108,6 +108,10 @@ class Trainer(AbstractTrainer):
         self.alpha1 = config['alpha1']
         self.alpha2 = config['alpha2']
         self.beta = config['beta']
+        self.test_eval_mode = config['test_eval_mode'] or 'on_valid_update'
+        if self.test_eval_mode not in {'on_valid_update', 'every_eval', 'none'}:
+            raise ValueError('test_eval_mode must be one of on_valid_update, every_eval, none')
+        self.profile_runtime = bool(config['profile_runtime'])
 
     def _build_optimizer(self):
         r"""Init the Optimizer
@@ -238,7 +242,7 @@ class Trainer(AbstractTrainer):
             # train
             training_start_time = time()
             self.model.pre_epoch_processing()
-            train_loss, _ = self._train_epoch(train_data, epoch_idx)
+            train_loss, loss_batches = self._train_epoch(train_data, epoch_idx)
             if torch.is_tensor(train_loss):
                 # get nan loss
                 break
@@ -253,6 +257,13 @@ class Trainer(AbstractTrainer):
             post_info = self.model.post_epoch_processing()
             if verbose:
                 self.logger.info(train_loss_output)
+                if self.profile_runtime:
+                    batch_count = len(loss_batches)
+                    avg_batch_time = (training_end_time - training_start_time) / batch_count if batch_count else 0.0
+                    self.logger.info(
+                        'runtime profile: epoch %d train_batches: %d, train_time: %.2fs, avg_batch_time: %.4fs' %
+                        (epoch_idx, batch_count, training_end_time - training_start_time, avg_batch_time)
+                    )
                 if post_info is not None:
                     self.logger.info(post_info)
 
@@ -267,18 +278,39 @@ class Trainer(AbstractTrainer):
                 valid_score_output = "epoch %d evaluating [time: %.2fs, valid_score: %f]" % \
                                      (epoch_idx, valid_end_time - valid_start_time, valid_score)
                 valid_result_output = 'valid result: \n' + dict2str(valid_result)
-                # test
-                _, test_result = self._valid_epoch(test_data)
+                test_result = None
+                should_test = test_data is not None and (
+                    self.test_eval_mode == 'every_eval' or
+                    (self.test_eval_mode == 'on_valid_update' and update_flag)
+                )
+                if should_test:
+                    test_start_time = time()
+                    _, test_result = self._valid_epoch(test_data)
+                    test_end_time = time()
                 if verbose:
                     self.logger.info(valid_score_output)
                     self.logger.info(valid_result_output)
-                    self.logger.info('test result: \n' + dict2str(test_result))
+                    if self.profile_runtime:
+                        self.logger.info(
+                            'runtime profile: epoch %d valid_eval_time: %.2fs' %
+                            (epoch_idx, valid_end_time - valid_start_time)
+                        )
+                    if test_result is not None:
+                        self.logger.info('test result: \n' + dict2str(test_result))
+                        if self.profile_runtime:
+                            self.logger.info(
+                                'runtime profile: epoch %d test_eval_time: %.2fs' %
+                                (epoch_idx, test_end_time - test_start_time)
+                            )
+                    elif self.profile_runtime and self.test_eval_mode == 'on_valid_update':
+                        self.logger.info('runtime profile: epoch %d test_eval_skipped: no valid improvement' % epoch_idx)
                 if update_flag:
                     update_output = '██ ' + self.config['model'] + '--Best validation results updated!!!'
                     if verbose:
                         self.logger.info(update_output)
                     self.best_valid_result = valid_result
-                    self.best_test_upon_valid = test_result
+                    if test_result is not None:
+                        self.best_test_upon_valid = test_result
 
                 if stop_flag:
                     stop_output = '+++++Finished training, best eval result in epoch %d' % \
