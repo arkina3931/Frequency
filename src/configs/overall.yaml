@@ -10,7 +10,9 @@ filter_out_cod_start_users: True
 is_multimodal_model: True
 
 checkpoint_dir: 'saved'
-save_recommended_topk: True
+checkpoint_file: null
+save_trained_model: True
+save_recommended_topk: False
 recommend_topk: 'recommend_topk/'
 test_eval_mode: on_valid_update
 profile_runtime: False

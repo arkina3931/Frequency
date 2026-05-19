@@ -112,6 +112,39 @@ class Trainer(AbstractTrainer):
         if self.test_eval_mode not in {'on_valid_update', 'every_eval', 'none'}:
             raise ValueError('test_eval_mode must be one of on_valid_update, every_eval, none')
         self.profile_runtime = bool(config['profile_runtime'])
+        self.save_trained_model = bool(config['save_trained_model'])
+
+    def _checkpoint_path(self):
+        checkpoint_file = self.config['checkpoint_file']
+        if checkpoint_file:
+            return os.path.abspath(checkpoint_file)
+        checkpoint_dir = self.config['checkpoint_dir'] or 'saved'
+        checkpoint_name = '{}-{}-best.pt'.format(self.config['model'], self.config['dataset'])
+        return os.path.abspath(os.path.join(checkpoint_dir, checkpoint_name))
+
+    def _checkpoint_config(self):
+        if hasattr(self.config, 'final_config_dict'):
+            config_dict = dict(self.config.final_config_dict)
+        else:
+            config_dict = dict(self.config)
+        if isinstance(config_dict.get('device'), torch.device):
+            config_dict['device'] = str(config_dict['device'])
+        return config_dict
+
+    def _save_checkpoint(self, epoch_idx, valid_score, valid_result, test_result):
+        checkpoint_path = self._checkpoint_path()
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        checkpoint = {
+            'state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'epoch': epoch_idx,
+            'valid_score': valid_score,
+            'valid_result': valid_result,
+            'test_result': test_result,
+            'config': self._checkpoint_config(),
+        }
+        torch.save(checkpoint, checkpoint_path)
+        self.logger.info('Saved best model checkpoint to {}'.format(checkpoint_path))
 
     def _build_optimizer(self):
         r"""Init the Optimizer
@@ -311,6 +344,10 @@ class Trainer(AbstractTrainer):
                     self.best_valid_result = valid_result
                     if test_result is not None:
                         self.best_test_upon_valid = test_result
+                    if saved and self.save_trained_model:
+                        self._save_checkpoint(
+                            epoch_idx, valid_score, self.best_valid_result, self.best_test_upon_valid
+                        )
 
                 if stop_flag:
                     stop_output = '+++++Finished training, best eval result in epoch %d' % \
