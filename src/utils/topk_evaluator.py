@@ -99,7 +99,89 @@ class TopKEvaluator(object):
             for k in self.topk:
                 key = '{}@{}'.format(metric, k)
                 metric_dict[key] = round(value[k - 1], 4)
+        extended_enabled = self.config['extended_eval_metrics']
+        if is_test and (extended_enabled is None or extended_enabled):
+            metric_dict.update(self._calculate_extended_metrics(topk_index, bool_rec_matrix, pos_items, pos_len_list, eval_data))
         return metric_dict
+
+    def _calculate_extended_metrics(self, topk_index, bool_rec_matrix, pos_items, pos_len_list, eval_data):
+        metric_dict = {}
+        item_num = eval_data.get_train_item_num()
+        item_popularity = eval_data.get_item_popularity()
+        item_bucket_masks = eval_data.get_item_bucket_masks()
+        user_group_masks = eval_data.get_user_group_masks()
+        pos_sets = [set(np.asarray(items, dtype=np.int64).tolist()) for items in pos_items]
+
+        for k in self.topk:
+            topk_at_k = topk_index[:, :k]
+            hit_at_k = bool_rec_matrix[:, :k]
+            metric_dict[f'hit@{k}'] = round(float(np.any(hit_at_k, axis=1).mean()), 4) if len(hit_at_k) else 0.0
+            metric_dict[f'coverage@{k}'] = round(float(len(np.unique(topk_at_k)) / item_num), 4) if item_num > 0 else 0.0
+            metric_dict[f'avg_pop@{k}'] = round(float(item_popularity[topk_at_k].mean()), 4) if topk_at_k.size else 0.0
+            metric_dict[f'gini@{k}'] = round(self._gini_from_topk(topk_at_k, item_num), 4)
+            tail_mask = item_bucket_masks['tail']
+            metric_dict[f'tail_ratio@{k}'] = round(float(tail_mask[topk_at_k].mean()), 4) if topk_at_k.size else 0.0
+            for bucket_name in ['head', 'mid', 'tail']:
+                metric_dict[f'{bucket_name}_recall@{k}'] = round(
+                    self._bucket_recall_at_k(topk_at_k, pos_sets, item_bucket_masks[bucket_name]), 4
+                )
+
+        ndcg_k = 20
+        topk_at_20 = topk_index[:, :ndcg_k]
+        for bucket_name in ['head', 'mid', 'tail']:
+            metric_dict[f'{bucket_name}_ndcg@20'] = round(
+                self._bucket_ndcg_at_k(topk_at_20, pos_sets, item_bucket_masks[bucket_name], ndcg_k), 4
+            )
+
+        recall_k = 20
+        user_recall_at_20 = bool_rec_matrix[:, :recall_k].sum(axis=1) / pos_len_list
+        for group_name in ['cold', 'warm', 'hot']:
+            group_mask = user_group_masks[group_name]
+            if np.any(group_mask):
+                metric_dict[f'{group_name}_recall@20'] = round(float(user_recall_at_20[group_mask].mean()), 4)
+            else:
+                metric_dict[f'{group_name}_recall@20'] = 0.0
+        return metric_dict
+
+    @staticmethod
+    def _gini_from_topk(topk_at_k, item_num):
+        if item_num <= 0 or topk_at_k.size == 0:
+            return 0.0
+        counts = np.bincount(topk_at_k.reshape(-1), minlength=item_num).astype(np.float64)
+        total = counts.sum()
+        if total <= 0:
+            return 0.0
+        sorted_counts = np.sort(counts)
+        index = np.arange(1, item_num + 1, dtype=np.float64)
+        return float((2.0 * np.sum(index * sorted_counts)) / (item_num * total) - (item_num + 1.0) / item_num)
+
+    @staticmethod
+    def _bucket_recall_at_k(topk_at_k, pos_sets, bucket_mask):
+        recall_values = []
+        bucket_items = set(np.where(bucket_mask)[0].tolist())
+        for rec_items, user_pos in zip(topk_at_k, pos_sets):
+            relevant = user_pos & bucket_items
+            if not relevant:
+                continue
+            hits = len(set(rec_items.tolist()) & relevant)
+            recall_values.append(hits / len(relevant))
+        return float(np.mean(recall_values)) if recall_values else 0.0
+
+    @staticmethod
+    def _bucket_ndcg_at_k(topk_at_k, pos_sets, bucket_mask, k):
+        ndcg_values = []
+        bucket_items = set(np.where(bucket_mask)[0].tolist())
+        discounts = 1.0 / np.log2(np.arange(2, k + 2))
+        for rec_items, user_pos in zip(topk_at_k, pos_sets):
+            relevant = user_pos & bucket_items
+            if not relevant:
+                continue
+            gains = np.asarray([item in relevant for item in rec_items[:k]], dtype=np.float64)
+            dcg = float(np.sum(gains * discounts[:len(gains)]))
+            ideal_len = min(len(relevant), k)
+            idcg = float(np.sum(discounts[:ideal_len]))
+            ndcg_values.append(dcg / idcg if idcg > 0 else 0.0)
+        return float(np.mean(ndcg_values)) if ndcg_values else 0.0
 
     def _check_args(self):
         # Check metrics

@@ -359,6 +359,8 @@ class EvalDataLoader(AbstractDataLoader):
         self.train_pos_len_list = []
 
         self.eval_u = self.dataset.df[self.dataset.uid_field].unique()
+        self.eval_user_np = np.asarray(self.eval_u, dtype=np.int64)
+        self._build_extended_eval_stats()
         # special for eval dataloader
         self.pos_items_per_u = self._get_pos_items_per_u(self.eval_u)
         self._get_eval_items_per_u(self.eval_u)
@@ -373,6 +375,45 @@ class EvalDataLoader(AbstractDataLoader):
 
     def _shuffle(self):
         self.dataset.shuffle()
+
+    def _build_extended_eval_stats(self):
+        uid_field = self.additional_dataset.uid_field
+        iid_field = self.additional_dataset.iid_field
+        item_ids = self.additional_dataset.df[iid_field].to_numpy(dtype=np.int64)
+        user_ids = self.additional_dataset.df[uid_field].to_numpy(dtype=np.int64)
+
+        self.train_item_num = self.additional_dataset.get_item_num()
+        self.item_popularity = np.bincount(item_ids, minlength=self.train_item_num).astype(np.float64)
+
+        order = np.lexsort((np.arange(self.train_item_num), self.item_popularity))
+        n_items = len(order)
+        tail_ratio = self.config['item_tail_ratio']
+        head_ratio = self.config['item_head_ratio']
+        tail_ratio = 0.5 if tail_ratio is None else tail_ratio
+        head_ratio = 0.2 if head_ratio is None else head_ratio
+        tail_count = int(np.ceil(n_items * tail_ratio))
+        head_count = int(np.ceil(n_items * head_ratio))
+        tail_count = min(max(tail_count, 0), n_items)
+        head_count = min(max(head_count, 0), max(n_items - tail_count, 0))
+
+        self.tail_item_mask = np.zeros(self.train_item_num, dtype=bool)
+        self.mid_item_mask = np.zeros(self.train_item_num, dtype=bool)
+        self.head_item_mask = np.zeros(self.train_item_num, dtype=bool)
+        if tail_count > 0:
+            self.tail_item_mask[order[:tail_count]] = True
+        if head_count > 0:
+            self.head_item_mask[order[n_items - head_count:]] = True
+        self.mid_item_mask = ~(self.tail_item_mask | self.head_item_mask)
+
+        user_history_len = np.bincount(user_ids, minlength=self.additional_dataset.get_user_num()).astype(np.int64)
+        eval_history_len = user_history_len[self.eval_user_np]
+        cold_max = self.config['cold_user_max_interactions']
+        hot_min = self.config['hot_user_min_interactions']
+        cold_max = 5 if cold_max is None else cold_max
+        hot_min = 21 if hot_min is None else hot_min
+        self.cold_user_mask = eval_history_len <= cold_max
+        self.hot_user_mask = eval_history_len >= hot_min
+        self.warm_user_mask = ~(self.cold_user_mask | self.hot_user_mask)
 
     def _next_batch_data(self):
         start = self.pr
@@ -435,5 +476,25 @@ class EvalDataLoader(AbstractDataLoader):
 
     def get_eval_users(self):
         return self.eval_u.cpu()
+
+    def get_train_item_num(self):
+        return self.train_item_num
+
+    def get_item_popularity(self):
+        return self.item_popularity
+
+    def get_item_bucket_masks(self):
+        return {
+            'head': self.head_item_mask,
+            'mid': self.mid_item_mask,
+            'tail': self.tail_item_mask,
+        }
+
+    def get_user_group_masks(self):
+        return {
+            'cold': self.cold_user_mask,
+            'warm': self.warm_user_mask,
+            'hot': self.hot_user_mask,
+        }
 
 

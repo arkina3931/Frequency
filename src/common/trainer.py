@@ -285,7 +285,7 @@ class Trainer(AbstractTrainer):
                 )
                 if should_test:
                     test_start_time = time()
-                    _, test_result = self._valid_epoch(test_data)
+                    test_result = self.evaluate(test_data, is_test=True, idx=epoch_idx)
                     test_end_time = time()
                 if verbose:
                     self.logger.info(valid_score_output)
