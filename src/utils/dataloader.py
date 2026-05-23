@@ -58,8 +58,8 @@ class AbstractDataLoader(object):
         self._refresh_cached_arrays()
 
     def _refresh_cached_arrays(self):
-        self.uid_array = self.dataset.df[self.dataset.uid_field].to_numpy(copy=False)
-        self.iid_array = self.dataset.df[self.dataset.iid_field].to_numpy(copy=False)
+        self.uid_array = self.dataset.df[self.dataset.uid_field].to_numpy(dtype=np.int64, copy=True)
+        self.iid_array = self.dataset.df[self.dataset.iid_field].to_numpy(dtype=np.int64, copy=True)
 
     def pretrain_setup(self):
         """This function can be used to deal with some problems after essential args are initialized,

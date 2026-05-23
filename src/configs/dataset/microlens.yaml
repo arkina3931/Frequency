@@ -12,5 +12,6 @@ inter_file_name: 'microlens.inter'
 vision_feature_file: 'image_feat.npy'
 text_feature_file: 'text_feat.npy'
 user_graph_dict_file: 'user_graph_dict.npy'
+user_emb_file: 'user_emb.npy'
 
 field_separator: "\t"

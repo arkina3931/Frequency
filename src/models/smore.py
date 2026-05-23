@@ -54,23 +54,23 @@ class SMORE(GeneralRecommender):
         if self.v_feat is not None:
             self.image_embedding = nn.Embedding.from_pretrained(self.v_feat, freeze=False)
             if os.path.exists(image_adj_file):
-                image_adj = torch.load(image_adj_file)
+                image_adj = self._load_sparse_cache(image_adj_file)
             else:
                 image_adj = build_sim(self.image_embedding.weight.detach())
                 image_adj = build_knn_normalized_graph(image_adj, topk=self.image_knn_k, is_sparse=self.sparse,
                                                        norm_type='sym')
-                torch.save(image_adj, image_adj_file)
-            self.image_original_adj = image_adj.cuda()
+                torch.save(image_adj.detach().cpu(), image_adj_file)
+            self.image_original_adj = image_adj.to(self.device).coalesce()
 
         if self.t_feat is not None:
             self.text_embedding = nn.Embedding.from_pretrained(self.t_feat, freeze=False)
             if os.path.exists(text_adj_file):
-                text_adj = torch.load(text_adj_file)
+                text_adj = self._load_sparse_cache(text_adj_file)
             else:
                 text_adj = build_sim(self.text_embedding.weight.detach())
                 text_adj = build_knn_normalized_graph(text_adj, topk=self.text_knn_k, is_sparse=self.sparse, norm_type='sym')
-                torch.save(text_adj, text_adj_file)
-            self.text_original_adj = text_adj.cuda() 
+                torch.save(text_adj.detach().cpu(), text_adj_file)
+            self.text_original_adj = text_adj.to(self.device).coalesce()
 
         self.fusion_adj = self.max_pool_fusion()
 
@@ -124,7 +124,23 @@ class SMORE(GeneralRecommender):
         self.image_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32))
         self.text_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32))
         self.fusion_complex_weight = nn.Parameter(torch.randn(1, self.embedding_dim // 2 + 1, 2, dtype=torch.float32))
-        
+
+    def _load_sparse_cache(self, file_path):
+        invariant_checker = getattr(torch.sparse, 'check_sparse_tensor_invariants', None)
+        if invariant_checker is None:
+            return torch.load(file_path, map_location=self.device)
+        with invariant_checker(False):
+            return torch.load(file_path, map_location=self.device)
+
+    def _sparse_coo_tensor(self, indices, values, shape, device=None):
+        invariant_checker = getattr(torch.sparse, 'check_sparse_tensor_invariants', None)
+        kwargs = {}
+        if device is not None:
+            kwargs['device'] = device
+        if invariant_checker is None:
+            return torch.sparse_coo_tensor(indices, values, shape, **kwargs).coalesce()
+        with invariant_checker(False):
+            return torch.sparse_coo_tensor(indices, values, shape, **kwargs).coalesce()
 
     def pre_epoch_processing(self):
         pass
@@ -148,7 +164,12 @@ class SMORE(GeneralRecommender):
         combined_values_text[unique_idx[image_indices.size(1):]] = text_values
         combined_values, _ = torch.max(torch.stack((combined_values_image, combined_values_text)), dim=0)
 
-        fusion_adj = torch.sparse.FloatTensor(combined_indices, combined_values, image_adj.size()).coalesce()
+        fusion_adj = self._sparse_coo_tensor(
+            combined_indices,
+            combined_values,
+            image_adj.size(),
+            device=self.device
+        )
 
         return fusion_adj
 
@@ -162,13 +183,13 @@ class SMORE(GeneralRecommender):
         adj_mat = adj_mat.todok()
 
         def normalized_adj_single(adj):
-            rowsum = np.array(adj.sum(1))
-
-            d_inv = np.power(rowsum, -0.5).flatten()
-            d_inv[np.isinf(d_inv)] = 0.
+            rowsum = np.asarray(adj.sum(1)).flatten()
+            d_inv = np.zeros_like(rowsum, dtype=np.float32)
+            nonzero_rows = rowsum > 0
+            d_inv[nonzero_rows] = np.power(rowsum[nonzero_rows], -0.5)
             d_mat_inv = sp.diags(d_inv)
 
-            norm_adj = d_mat_inv.dot(adj_mat)
+            norm_adj = d_mat_inv.dot(adj)
             norm_adj = norm_adj.dot(d_mat_inv)
             return norm_adj.tocoo()
 
@@ -183,7 +204,11 @@ class SMORE(GeneralRecommender):
         indices = torch.from_numpy(np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
         values = torch.from_numpy(sparse_mx.data)
         shape = torch.Size(sparse_mx.shape)
-        return torch.sparse.FloatTensor(indices, values, shape)
+        return self._sparse_coo_tensor(
+            indices,
+            values,
+            shape
+        )
 
     def spectrum_convolution(self, image_embeds, text_embeds):
         """
