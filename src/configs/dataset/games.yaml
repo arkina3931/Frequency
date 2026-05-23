@@ -4,7 +4,7 @@ ITEM_ID_FIELD: itemID
 #RATING_FIELD: rating
 TIME_FIELD: timestamp
 
-DELTA_T_FIELD: gap_sec
+filter_out_cod_start_users: True
 
 inter_file_name: 'games.inter'
 
